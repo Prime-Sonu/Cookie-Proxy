@@ -1,0 +1,10 @@
+{
+  "name": "relay-proxy",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
