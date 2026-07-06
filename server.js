@@ -1,126 +1,157 @@
-// server.js
 import express from "express";
 
 const app = express();
-app.use(express.raw({ type: "*/*", limit: "25mb" }));
 
-const PORT = process.env.PORT || 3000;
-const PROXY_SECRET = process.env.PROXY_SECRET || "";
-const ALLOWED_HOSTS = new Set(
-  (process.env.ALLOWED_HOSTS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-);
+const PORT = Number(process.env.PORT || 3000);
+const UPSTREAM_URL = process.env.UPSTREAM_URL || "https://jiotvplusapi.vvishwas042.workers.dev";
 
-function isAllowedTarget(input) {
-  try {
-    const u = new URL(input);
-    return ALLOWED_HOSTS.has(u.hostname);
-  } catch {
-    return false;
-  }
+// Non-secret, fixed service defaults kept in code.
+const REQUEST_TIMEOUT_MS = 30000;
+const CORS_ORIGIN = "*";
+const FORWARD_HEADER_NAMES = ["accept", "user-agent"];
+const UPSTREAM_STATIC_HEADERS = {};
+
+function setCors(res) {
+res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie, X-Requested-With");
+res.setHeader("Access-Control-Max-Age", "86400");
+res.setHeader("Vary", "Origin");
 }
 
-function safeForwardHeaders(req, targetUrl) {
-  const headers = new Headers();
-
-  const copyList = [
-    "accept",
-    "accept-language",
-    "content-type",
-    "user-agent",
-    "referer",
-    "origin",
-    "authorization",
-    "cookie",
-    "x-requested-with"
-  ];
-
-  for (const name of copyList) {
-    const value = req.headers[name];
-    if (value) headers.set(name, value);
-  }
-
-  headers.set("accept", req.headers["accept"] || "*/*");
-  headers.set("user-agent", req.headers["user-agent"] || "Mozilla/5.0");
-  headers.set("origin", targetUrl.origin);
-  headers.set("referer", targetUrl.origin + "/");
-
-  if (PROXY_SECRET) {
-    headers.set("x-proxy-secret", PROXY_SECRET);
-  }
-
-  return headers;
+function normalizeUpstreamUrl(value) {
+try {
+const url = new URL(value);
+if (!["http:", "https:"].includes(url.protocol)) return null;
+return url;
+} catch {
+return null;
+}
 }
 
-app.all("/proxy", async (req, res) => {
-  const target = req.query.url;
-  const token = req.query.token;
+function buildUpstreamHeaders(req) {
+const headers = new Headers();
 
-  if (!target || typeof target !== "string") {
-    return res.status(400).send("Missing url");
-  }
+for (const name of FORWARD_HEADER_NAMES) {
+const value = req.headers[name];
+if (typeof value === "string" && value.length > 0) {
+headers.set(name, value);
+}
+}
 
-  if (PROXY_SECRET && token !== PROXY_SECRET) {
-    return res.status(401).send("Bad proxy token");
-  }
+for (const [name, value] of Object.entries(UPSTREAM_STATIC_HEADERS)) {
+if (typeof value === "string" && value.length > 0) {
+headers.set(name.toLowerCase(), value);
+}
+}
 
-  if (!isAllowedTarget(target)) {
-    return res.status(403).send("Target host not allowed");
-  }
+if (!headers.has("accept")) {
+headers.set("accept", "application/json, text/plain, /");
+}
 
-  let targetUrl;
-  try {
-    targetUrl = new URL(target);
-  } catch {
-    return res.status(400).send("Invalid url");
-  }
+if (!headers.has("user-agent")) {
+headers.set("user-agent", "ProxyService/1.0");
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+return headers;
+}
 
-  try {
-    const headers = safeForwardHeaders(req, targetUrl);
+function renameTvgIdToId(value) {
+if (Array.isArray(value)) {
+return value.map(renameTvgIdToId);
+}
 
-    const init = {
-      method: req.method,
-      headers,
-      redirect: "follow",
-      signal: controller.signal
-    };
+if (value && typeof value === "object") {
+const out = {};
+for (const [key, val] of Object.entries(value)) {
+const nextKey = key === "tvgId" ? "id" : key;
+out[nextKey] = renameTvgIdToId(val);
+}
+return out;
+}
 
-    if (!["GET", "HEAD"].includes(req.method)) {
-      init.body = req.body;
-    }
+return value;
+}
 
-    const upstream = await fetch(targetUrl.toString(), init);
+async function readUpstreamJson(response) {
+const contentType = response.headers.get("content-type") || "";
+const rawText = await response.text();
 
-    const responseHeaders = new Headers(upstream.headers);
-    responseHeaders.set("access-control-allow-origin", "*");
-    responseHeaders.set("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-    responseHeaders.set("access-control-allow-headers", "Content-Type, Authorization, Cookie, X-Requested-With");
-    responseHeaders.set("x-proxy-upstream-status", String(upstream.status));
+try {
+return JSON.parse(rawText);
+} catch {
+const looksJson = contentType.includes("application/json") || contentType.includes("+json");
+if (!looksJson) {
+throw new Error("Upstream returned non-JSON response");
+}
+throw new Error("Upstream returned invalid JSON");
+}
+}
 
-    res.status(upstream.status);
-    for (const [k, v] of responseHeaders.entries()) {
-      try {
-        res.setHeader(k, v);
-      } catch {}
-    }
-
-    const body = Buffer.from(await upstream.arrayBuffer());
-    return res.send(body);
-  } catch (err) {
-    const msg = err?.name === "AbortError" ? "Upstream timeout" : "Proxy failed";
-    return res.status(502).send(msg);
-  } finally {
-    clearTimeout(timeout);
-  }
+app.use((req, res, next) => {
+setCors(res);
+if (req.method === "OPTIONS") return res.sendStatus(204);
+next();
 });
 
-app.get("/health", (_, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => {
+setCors(res);
+res.status(200).json({ ok: true });
+});
+
+app.get("/proxy", async (req, res) => {
+setCors(res);
+
+const upstreamUrl = normalizeUpstreamUrl(UPSTREAM_URL);
+if (!upstreamUrl) {
+return res.status(500).json({
+error: "Server configuration error",
+message: "UPSTREAM_URL is missing or invalid"
+});
+}
+
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+try {
+const upstreamResponse = await fetch(upstreamUrl.toString(), {
+method: "GET",
+headers: buildUpstreamHeaders(req),
+redirect: "follow",
+signal: controller.signal
+});
+
+if (!upstreamResponse.ok) {
+  return res.status(502).json({
+    error: "Upstream request failed",
+    upstreamStatus: upstreamResponse.status
+  });
+}
+
+const parsed = await readUpstreamJson(upstreamResponse);
+const transformed = renameTvgIdToId(parsed);
+
+res.status(200);
+res.setHeader("Content-Type", "application/json; charset=utf-8");
+return res.send(JSON.stringify(transformed));
+
+} catch (err) {
+const isTimeout = err?.name === "AbortError";
+return res.status(isTimeout ? 504 : 502).json({
+error: isTimeout ? "Upstream timeout" : "Proxy error",
+message: isTimeout ? "The upstream request timed out" : (err?.message || "Unknown error")
+});
+} finally {
+clearTimeout(timer);
+}
+});
+
+app.use((_req, res) => {
+setCors(res);
+res.status(404).json({ error: "Not found" });
+});
 
 app.listen(PORT, () => {
-  console.log(`Proxy listening on ${PORT}`);
+console.log("Proxy service listening on port ${PORT}");
+console.log("Upstream source: ${UPSTREAM_URL}");
 });
