@@ -1,116 +1,117 @@
-// server.js
 const express = require("express");
-const cors = require("cors");
+const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Put your own public URL here
-const SOURCE_URL = "https://vortextv.modsdone.com/cricfy.php/channels?url=https://tataplayyash.streamxlive.workers.dev/";
+// -------------------------------------------------------
+//  M3U Parser — extracts name, id, cookie per channel
+// -------------------------------------------------------
+function parseM3U(content) {
+  const lines = content.split("\n");
+  const channels = [];
 
-app.use(cors());
-app.use(express.json());
+  let currentChannel = null;
 
-function parseM3U(text) {
-  const lines = String(text)
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
 
-  const items = [];
-  let current = null;
-
-  for (const line of lines) {
+    // ── #EXTINF line ────────────────────────────────────
     if (line.startsWith("#EXTINF:")) {
-      const commaIndex = line.lastIndexOf(",");
-      const meta = commaIndex >= 0 ? line.slice(0, commaIndex) : line;
-      const name = commaIndex >= 0 ? line.slice(commaIndex + 1).trim() : "";
+      // tvg-id="1691"
+      const tvgIdMatch = line.match(/tvg-id="([^"]+)"/);
+      const id = tvgIdMatch ? tvgIdMatch[1] : null;
 
-      const attrs = {};
-      const attrRegex = /([a-zA-Z0-9_-]+)="([^"]*)"/g;
-      let m;
-      while ((m = attrRegex.exec(meta)) !== null) {
-        attrs[m[1]] = m[2];
-      }
+      // Channel name is everything after the LAST comma
+      const nameMatch = line.match(/,(.+)$/);
+      const name = nameMatch ? nameMatch[1].trim() : null;
 
-      current = { name, ...attrs };
-    } else if (line.startsWith("#")) {
-      continue;
-    } else {
-      if (current) {
-        current.url = line;
-        items.push(current);
-        current = null;
+      currentChannel = { name, id, cookie: null };
+    }
+
+    // ── #EXTHTTP line ───────────────────────────────────
+    else if (line.startsWith("#EXTHTTP:") && currentChannel) {
+      try {
+        const jsonStr = line.replace("#EXTHTTP:", "").trim();
+        const httpData = JSON.parse(jsonStr);
+        currentChannel.cookie = httpData.cookie || null;
+      } catch (_) {
+        // malformed JSON — skip
       }
+    }
+
+    // ── Stream URL line → commit channel ────────────────
+    else if (
+      !line.startsWith("#") &&
+      line.startsWith("http") &&
+      currentChannel
+    ) {
+      channels.push(currentChannel);
+      currentChannel = null;
     }
   }
 
-  return items;
+  return channels;
 }
 
+// -------------------------------------------------------
+//  Routes
+// -------------------------------------------------------
+
+/**
+ * GET /channels
+ * Query param: url  (the M3U source URL)
+ * Example: /channels?url=https://tataplayyash.streamxlive.workers.dev/
+ */
+app.get("/channels", async (req, res) => {
+  const sourceUrl = req.query.url;
+
+  if (!sourceUrl) {
+    return res.status(400).json({
+      error: "Missing required query parameter: url",
+      example: "/channels?url=https://tataplayyash.streamxlive.workers.dev/",
+    });
+  }
+
+  try {
+    const response = await axios.get(sourceUrl, {
+      timeout: 30000,
+      headers: {
+        "User-Agent": "plaYtv/7.1.3 (Linux;Android 13)",
+      },
+      responseType: "text",
+    });
+
+    const m3uContent = response.data;
+    const channels = parseM3U(m3uContent);
+
+    return res.json({
+      total: channels.length,
+      source: sourceUrl,
+      channels,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: "Failed to fetch or parse M3U source",
+      detail: err.message,
+    });
+  }
+});
+
+/**
+ * GET /
+ * Health check
+ */
 app.get("/", (_req, res) => {
   res.json({
-    ok: true,
-    endpoints: ["/proxy", "/m3u-to-json"],
+    status: "ok",
+    usage: "GET /channels?url=<m3u_source_url>",
   });
 });
 
-app.get("/proxy", async (_req, res) => {
-  try {
-    const response = await fetch(SOURCE_URL, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-      },
-    });
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        ok: false,
-        error: `Upstream returned ${response.status}`,
-      });
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      const data = await response.json();
-      return res.json(data);
-    }
-
-    const text = await response.text();
-    return res.type("text/plain").send(text);
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
-app.post("/m3u-to-json", (req, res) => {
-  const { text } = req.body || {};
-  if (!text) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing 'text' in request body",
-    });
-  }
-
-  try {
-    const data = parseM3U(text);
-    return res.json({
-      ok: true,
-      count: data.length,
-      data,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
+// -------------------------------------------------------
+//  Start server
+// -------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅  M3U Parser API running on port ${PORT}`);
 });
