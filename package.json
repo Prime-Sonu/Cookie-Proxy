@@ -1,6 +1,6 @@
 {
   "name": "m3u-parser-api",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "description": "Fetches an M3U playlist and returns channel name, tvg-id and cookie as JSON",
   "main": "server.js",
   "scripts": {
