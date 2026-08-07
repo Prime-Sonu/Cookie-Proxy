@@ -4,10 +4,14 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Hardcoded M3U source ──────────────────────────────
 const M3U_SOURCE = "https://vortextv.modsdone.com/cricfy.php/channels?url=https://tataplayyash.streamxlive.workers.dev/";
+const KEYWORDS = ["Star Sports", "Sony Sports", "Sony Ten", "Sony"];
 
-// ── Parser ────────────────────────────────────────────
+function matchesKeywords(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()));
+}
 function parseM3U(content) {
   const lines = content.split("\n");
   const channels = [];
@@ -37,8 +41,6 @@ function parseM3U(content) {
 
   return channels;
 }
-
-// ── Route ─────────────────────────────────────────────
 app.get("/", async (_req, res) => {
   try {
     const response = await axios.get(M3U_SOURCE, {
@@ -47,7 +49,9 @@ app.get("/", async (_req, res) => {
       responseType: "text",
     });
 
-    const channels = parseM3U(response.data);
+    const allChannels = parseM3U(response.data);
+    const channels    = allChannels.filter((ch) => matchesKeywords(ch.name));
+
     res.json({ total: channels.length, channels });
   } catch (err) {
     res.status(500).json({ error: err.message });
